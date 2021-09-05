@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+
+from __future__ import print_function
+import lxml.html
+from lxml.etree import XPath
+import os
+import sys
+import argparse
+import re
+import datetime
+import json
+import urllib.request
+from influxdb import line_protocol
+
+DEFAULT_ZYXEL_HOSTNAME = '192.168.2.1'
+DEFAULT_ZYXEL_USER = 'admin'
+DEFAULT_TIMEOUT = 5
+COMMON_STATS_INT_FIELDS = [ 'Connection retrains' ]
+SESSION_FILE = '/tmp/zyxel-vdsl-session'
+MEASUREMENT_NAMES = {
+    'CommonStats': 'zyxel_vdsl_common',
+    'Speed': 'zyxel_vdsl_speed',
+    'Data': 'zyxel_vdsl_data',
+    'Indicator': 'zyxel_vdsl_indicator'
+}
+
+LEGACY_LOOKUP = {
+    'Current DSL data rate': 'Current data rate',
+    'DSL performance capacity': 'Performance capacity'
+}
+
+credentials = None
+
+def resolve_label(label):
+    if label in LEGACY_LOOKUP:
+        return LEGACY_LOOKUP[label]
+    return label
+
+def generate_reports(html, ids):
+    root = lxml.html.fromstring(html)
+
+    label_xpath = XPath("th[1]/label/text()")
+    value_xpath = XPath("td/text()")
+    column_header_xpath = XPath("th[position()>1]/text()")   
+
+    reports = {}
+
+    for report_id in ids:
+        reports[report_id] = {}
+        report_xpath = XPath("//table[@id='%s']/tr" % report_id)
+        header = None
+
+        for i, row in enumerate(report_xpath(root)):
+            if i == 0 and report_id != 'CommonStats':
+                header = column_header_xpath(row)
+                continue
+
+            label = resolve_label(label_xpath(row)[0].rstrip(':'))
+            values = value_xpath(row)
+
+            try:
+                if report_id != 'CommonStats':
+                    reports[report_id]["%s %s" % ( header[0], label)] = extract_number(values[0])
+                    reports[report_id]["%s %s" % ( header[1], label)] = extract_number(values[1])
+                else:
+                    if label in COMMON_STATS_INT_FIELDS:
+                        reports[report_id][label] = int(values[0])
+                    else:
+                        reports[report_id][label] = values[0]
+            except IndexError: pass
+
+    return reports
+
+def extract_number(s):
+    s = s.strip()
+    try:
+        return int(s)
+    except ValueError:
+        res = re.search(r'^([\d.]+)\xa0.+$', s, re.ASCII)
+        if res: return float((res.group(1)))
+    return s
+
+def extract_sid_from_html(html):
+    sid_xpath = XPath("//input[@id='sid']/@value")
+    root = lxml.html.fromstring(html)  
+    return sid_xpath(root)[0]
+
+def extract_tid_from_html(html):
+    m = re.search(r"Env.setToken\('tid','(\w+)'\);", html)
+    return m.group(1)
+
+def extract_current_user_from_html(html):
+    user_xpath = XPath("//*[@id='system_user']/span/text()")
+    root = lxml.html.fromstring(html)
+    return user_xpath(root)[0].strip()
+
+# derived from https://stackoverflow.com/a/681182/1387396
+def encode_multipart_formdata(fields):
+    LIMIT = '------MSi9x5NJropH87Yt79EGtnDKCM1SKDUSYk'
+    CRLF = '\r\n'
+    l = []
+    for key, value in fields.items():
+        l.append('--' + LIMIT)
+        l.append('Content-Disposition: form-data; name="%s"' % key)
+        l.append('')
+        l.append(value)
+    l.append('--' + LIMIT + '--')
+    l.append('')
+    body = CRLF.join(l).encode()
+    content_type = 'multipart/form-data; boundary=%s' % LIMIT
+    return content_type, body
+
+def set_session_language(session, lang):
+    fields = {
+        "sid": session['sid'],
+        "tid": session['tid'],
+        "controller": "SasLogin",
+        "action": "language",
+        "Language": lang
+    }
+    headers = { 'Content-Type': 'application/x-www-form-urlencoded' }
+    data = urllib.parse.urlencode(fields).encode()
+    req = urllib.request.Request('http://%s/webng.cgi' % credentials.hostname, data=data, headers=headers)
+    urllib.request.urlopen(req)
+
+def acquire_session(force_renew=False):
+    global credentials
+
+    #
+    # Step 0: Read existing session from file (if any)
+    #
+    if not force_renew:
+        try:
+            with open(SESSION_FILE) as f:
+                session = json.load(f)
+                if session['hostname'] == credentials.hostname and session['sid'] and session['tid']:
+                    eprint('Using existing session %s' % session['sid'])
+                    return session
+        except:
+            eprint("No existing session found")
+
+    eprint("Logging in with user %s" % credentials.username)
+
+    #
+    # Step 1: Get session ID
+    #
+    req = urllib.request.Request('http://%s/webng.cgi' % credentials.hostname)
+    with urllib.request.urlopen(req) as response: html = response.read()
+    sid = extract_sid_from_html(html)
+
+    #
+    # Step 2: Authenticate
+    #
+    fields = {
+        "sid": sid,
+        "tid": "",
+        "controller": "SasLogin",
+        "action": "login",
+        "id": "0",
+        "LoginName": credentials.username,
+        "LoginPass": credentials.password
+    }
+    content_type, data = encode_multipart_formdata(fields)
+    headers = { 'Cookie': 'SESSION_ID=%s' % sid, 'Content-Type': content_type }
+
+    req = urllib.request.Request('http://%s/webng.cgi' % credentials.hostname, data=data, headers=headers)
+
+    with urllib.request.urlopen(req) as response:
+        # The status code is always 200, so let's look at the HTML response to see if login succeeded.
+        html = response.read().decode('utf-8')
+
+        try:
+            extract_current_user_from_html(html)
+        except IndexError:
+            raise Exception("Login failed (invalid credentials?)")
+
+    tid = extract_tid_from_html(html)
+    session = { 'hostname': credentials.hostname, 'sid': sid, 'tid': tid }
+
+    #
+    # Step 3: Set session to English language (this is important because we use the field names from the UI)
+    #
+
+    #
+    # Step 4: Persist session for subsequent runs
+    #
+    os.umask(0)
+    with open(os.open(SESSION_FILE, os.O_CREAT | os.O_WRONLY, 0o600), 'w') as f:
+        json.dump(session, f)
+
+    eprint("Login sucessful")
+    return session
+
+def get_vdsl_status():
+
+    session = acquire_session()
+
+    html = None
+
+    for i in range(2):
+        try:
+            query_string = urllib.parse.urlencode({
+                'ajaxrequest': 2,
+                'sid': session['sid'],
+                'tid': session['tid'],
+                'controller': 'Ajax',
+                'action': 'index',
+                'id': 0,
+                'subcontroller': 'Internet',
+                'subaction': 'renderDslState',
+                'evalJS': 'force'
+            })
+
+            headers = { 'Cookie': 'SESSION_ID=%s' % session['sid'] }
+
+            set_session_language(session, 'en')
+
+            req = urllib.request.Request('http://%s/webng.cgi?%s' % ( session['hostname'], query_string ), headers=headers)
+            with urllib.request.urlopen(req) as response:
+                html = response.read().decode('utf-8')
+
+            eprint("Retrieved data")
+            break
+
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                eprint("Session expired, trying to renew")
+                session = acquire_session(True)
+            else: raise
+            continue
+
+    if not html: raise Exception('Failed to get data')
+
+    return generate_reports(html, [ 'CommonStats', 'Speed', 'Data', 'Indicator' ])
+
+def get_data_points(status):
+    data = { "points": [] }
+    time = get_current_utc_time()
+
+    for report_id, report in status.items():
+        data["points"].append({
+            "measurement": MEASUREMENT_NAMES[report_id],
+            "fields": report,
+            "time": time
+        })
+
+    return data
+
+def get_current_utc_time():
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat()
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+def main():
+    global credentials
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hostname", default=DEFAULT_ZYXEL_HOSTNAME,
+                        help="Specify URL (defaults to %s)" % DEFAULT_ZYXEL_HOSTNAME)
+    parser.add_argument("-u", "--username", default=DEFAULT_ZYXEL_USER,
+                        help="Specify username (defaults to %s)" % DEFAULT_ZYXEL_USER)
+    parser.add_argument("-p", "--password", default='',
+                        help="Specify password (no default)")
+
+    credentials = parser.parse_args()
+
+    status = get_vdsl_status()   
+    print(line_protocol.make_lines(get_data_points(status)))
+
+if __name__ == '__main__':
+    main()

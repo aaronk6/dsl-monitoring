@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+
+from __future__ import print_function
+import sys
+import argparse
+import telnetlib
+import re
+import datetime
+from influxdb import line_protocol
+
+DEFAULT_VIGOR_HOST = '192.168.1.1'
+DEFAULT_VIGOR_USER = 'admin'
+DEFAULT_VIGOR_PASSWORD = 'admin'
+DEFAULT_TIMEOUT = 5
+MEASUREMENT_NAME_COUNTS = 'vigor_vdsl'
+MEASUREMENT_NAME_STATUS = 'vigor_vdsl_status'
+PROMPT_RE = re.compile(b"\w+> ")
+
+def get_vdsl_status(host, user, password):
+    tn = telnetlib.Telnet(host)
+
+    tn.read_until(b'Account:')
+    tn.write(user.encode('utf-8') + b"\n")
+
+    tn.read_until(b'Password: ')
+    tn.write(password.encode('utf-8') + b"\n")
+
+    res = tn.expect([ PROMPT_RE ], DEFAULT_TIMEOUT) # look for prompt, could be "DrayTek> "
+    if not res[1]:
+        eprint("Failed to login via Telnet (didn't see the Vigor prompt in time, wrong username/password?)")
+        return False
+
+    tn.write(b"vdsl status counts\n")
+    vdsl_status_counts = read_until_prompt(tn)
+
+    tn.write(b"vdsl status\n")
+    vdsl_status = read_until_prompt(tn)
+
+    tn.write(b"exit\n")
+
+    return [ vdsl_status_counts, vdsl_status ]
+
+def read_until_prompt(tn):
+    return tn.expect([ PROMPT_RE ], DEFAULT_TIMEOUT)[2].decode('utf-8')
+
+def parse_vdsl_status_counts(output):
+    # Example output:
+
+    #   ---------------------- ATU-R Info (hw: annex B, f/w: annex A/B/C) -----------
+    #  [ Counters: Showtime ]
+    #                   Near End        Far End    Note
+    #  ElapsedTime  :   145464            145464 (seconds)
+    #  CRC          :      6               0
+    #  FEC          :      0               0
+    #  HEC          :      0               0
+    #  CRC_P        :      1               0
+    #  CRCP_P       :      0               0
+    #  CVP_P        :      0               0
+    #  NCD          :      0               0
+    #  LCD          :      0               0
+    #  ES           :      0             999
+    #  SES          :      0               0
+    #  LOSS         :      0               0
+    #  UAS          :      0               0
+    #  LOFS         :      0               0
+
+    #  [ Counters: 15Min ]
+    #                   Near End        Far End    Note
+    #  ElapsedTime  :    184             184 (seconds)
+    #  CRC          :      0               0
+    #  FEC          :      0               0
+    #  HEC          :      0               0
+    #  CRC_P        :      0               0
+    #  CRCP_P       :      0               0
+    #  CVP_P        :      0               0
+    #  NCD          :      0               0
+    #  LCD          :      0               0
+    #  ES           :      0               0
+    #  SES          :      0               0
+    #  LOSS         :      0               0
+    #  UAS          :      0               0
+    #  LOFS         :      0               0
+
+    #  [ Counters: 1DAY ]
+    #                   Near End        Far End    Note
+    #  ElapsedTime  :   64984            64984 (seconds)
+    #  CRC          :      0               0
+    #  FEC          :      0               0
+    #  HEC          :      0               0
+    #  CRC_P        :      0               0
+    #  CRCP_P       :      0               0
+    #  CVP_P        :      0               0
+    #  NCD          :      0               0
+    #  LCD          :      0               0
+    #  ES           :      0              18
+    #  SES          :      0               0
+    #  LOSS         :      0               0
+    #  UAS          :      0               0
+    #  LOFS         :      0               0
+
+    counter_timeframe = None
+    stats = {}
+
+    for line in output.splitlines():
+        if not line.startswith(' ') or line.startswith('  --'): continue
+        
+        m = re.match(r' \[ Counters: (.*) \]', line)
+        if (m):
+            counter_timeframe = m.group(1)
+            continue
+
+        columns = line.split(':')
+        if len(columns) < 2: continue
+
+        timeframe = columns[0].strip()
+        counter_values = columns[1].split()
+
+        if not stats.get(counter_timeframe):
+            stats[counter_timeframe] = {}
+        
+        # * convert values to integer
+        # * pick only the first two values, omitting the "note" column
+        stats[counter_timeframe][timeframe] = list(map(int, counter_values[:2]))
+
+    return stats
+
+def parse_vdsl_status(output):
+    # Example output:
+
+    #   Running Mode            :      17A       State                : SHOWTIME
+    #   DS Actual Rate          :107737000 bps   US Actual Rate       : 36996000 bps
+    #   DS Attainable Rate      :145155176 bps   US Attainable Rate   : 45164000 bps
+    #   DS Path Mode            :        Fast    US Path Mode         :  Interleave 
+    #   DS Interleave Depth     :        1       US Interleave Depth  :      367 
+    #   NE Current Attenuation  :        4 dB    Cur SNR Margin       :       17  dB
+    #   DS actual PSD           :    14. 4 dB    US actual PSD        :    -4.-8  dB
+    #   NE CRC Count            :        0       FE CRC Count         :        0
+    #   NE ES Count             :        0       FE  ES Count         :      999
+    #   Xdsl Reset Times        :        0       Xdsl Link  Times     :        4
+    #   ITU Version[0]          : 00000000       ITU Version[1]       : 00000000
+    #   VDSL Firmware Version   : 08-0B-02-06-00-07   [with Vectoring support] 
+    #   Power Management Mode   : DSL_G997_PMS_L0 
+    #   Test Mode               : DISABLE 
+    #   Far Current Attenuation :        2 dB    Far SNR Margin       :        9  dB
+    #   CO ITU Version[0]       : b5004244       CO ITU Version[1]    : 434db205
+    #   DSLAM CHIPSET VENDOR    : < BDCM >
+
+    stats = {}
+
+    def strip_unit(s):
+        res = re.search(r'^([\d.]+) \w+$', s, re.ASCII)
+        if res: return float((res.group(1)))
+        return s
+
+    def get_key_value(s):
+        return list(map(str.strip, s.split(':')))
+
+    for line in output.splitlines():
+        if not line.startswith(' ') or line.startswith('  --'): continue
+        columns = line.count(':')
+
+        if(columns) == 2:
+            part = get_key_value(line[:44])
+            stats[part[0]] = strip_unit(part[1])
+            part = get_key_value(line[44:])
+            stats[part[0]] = strip_unit(part[1])
+        elif(columns) == 1:
+            part = get_key_value(line)
+            stats[part[0]] = strip_unit(part[1])
+
+    return stats
+
+def get_data_points(vdsl_status_counts, vdsl_status):
+    data = { "points": [] }
+
+    # vdsl_status_counts
+    for timeframe, fields in vdsl_status_counts.items():
+
+        fields_flat = {}
+        for field, values in fields.items():
+            fields_flat["%s_near_end" % field] = values[0]
+            fields_flat["%s_far_end" % field] = values[1]
+
+        data["points"].append({
+            "measurement": MEASUREMENT_NAME_COUNTS,
+            "tags": {
+                "timeframe": timeframe
+            },
+            "fields": fields_flat,
+            "time": get_current_utc_time()
+        })
+
+    # vdsl_status   
+    data["points"].append({
+        "measurement": MEASUREMENT_NAME_STATUS,
+        "fields": vdsl_status,
+        "time": get_current_utc_time()
+    })
+
+    return data
+
+def get_current_utc_time():
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat()
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+def main():
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default=DEFAULT_VIGOR_HOST,
+                        help="Specify URL (defaults to %s)" % DEFAULT_VIGOR_HOST)
+    parser.add_argument("-u", "--username", default=DEFAULT_VIGOR_USER,
+                        help="Specify username (defaults to %s)" % DEFAULT_VIGOR_USER)
+    parser.add_argument("-p", "--password", default=DEFAULT_VIGOR_PASSWORD,
+                        help="Specify password (defaults to %s)" % DEFAULT_VIGOR_PASSWORD)
+
+    args = parser.parse_args()
+
+    vdsl_status_raw = get_vdsl_status(args.host, args.username, args.password)
+
+    if not vdsl_status_raw:
+        exit(1)
+
+    vdsl_status_counts = parse_vdsl_status_counts(vdsl_status_raw[0])
+    vdsl_status = parse_vdsl_status(vdsl_status_raw[1])
+
+    print(line_protocol.make_lines(get_data_points(vdsl_status_counts, vdsl_status)))
+
+if __name__ == '__main__':
+    main()

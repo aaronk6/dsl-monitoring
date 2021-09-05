@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import urllib.request, urllib.parse, urllib.error
+import sys
+import json
+import argparse
+from datetime import datetime
+import re
+from time import sleep
+from influxdb import line_protocol
+
+MEASUREMENT_NAME = 'telekom_verfuegbarkeit'
+SESSION_URL = 'https://ebs01.telekom.de/acproxy/usesCaptcha.do?source=verfuegbarkeit'
+API_URL = 'https://ebs01.telekom.de/acproxy/ace.do'
+USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.142 Safari/537.36'
+MAX_RETRIES = 10
+RETRY_WAIT = 3
+TIMEOUT = 30
+
+def get_session_id():
+    req = urllib.request.Request(SESSION_URL)
+    res = urllib.request.urlopen(req, None, TIMEOUT)
+    headers = list(res.info().items())
+    session_id = ""
+
+    for header in headers:
+        if header[0] and header[0].lower() == 'set-cookie':
+            m = re.search('JSESSIONID=(.*?);', header[1])
+            session_id = m.group(1)
+            break
+
+    return session_id
+
+def get_verfuegbarkeit(strasse, hausnummer, plz, ort, ortsteil='', hausnummerzusatz=''):
+    data = {
+        # configurable params
+        'plz': plz,
+        'strasse': strasse,
+        'hausnummer': hausnummer,
+        'hausnummerzusatz': hausnummerzusatz,
+        'ort': ort,
+        'ortsteil': ortsteil,
+        # hard-coded params
+        'captchacode': '',
+        'source': 'verfuegbarkeit',
+        'ausbauinformationen': 'true',
+        'wholebuy': 'true',
+        'empfehlung': 'true',
+        'ausbaufiber': 'true',
+        'ausbautmagic': 'true',
+        'geschaeftsfall': '2000',
+        'geschaeftsfallVespa': 'BESTANDSKUNDE_AENDERN',
+        'geschaeftsfallPom': 'UPGRADE',
+        'komplettwechsel': 'false',
+        'homespassed': 'true'
+    }
+
+    res = None
+
+    for i in range(MAX_RETRIES+1):
+        try:
+            headers = {
+                'User-Agent': USER_AGENT,
+                'Accept': 'application/json',
+                'Content-Type':  'application/x-www-form-urlencoded',
+                'Cookie': 'JSESSIONID=' + get_session_id()
+            }
+            req = urllib.request.Request(API_URL, headers=headers, data=urllib.parse.urlencode(data).encode("utf-8"))
+            res = json.loads(urllib.request.urlopen(req).read().decode('utf-8'))
+        except Exception as e:
+            eprint("Error: %s" % e)
+            if i < MAX_RETRIES:
+                eprint("Will do %i. retry in %i sec(s)..." % (i+1, RETRY_WAIT ))
+                sleep(RETRY_WAIT)
+            else:
+                eprint("Maximum number of retries exceeded, giving up")
+            continue
+        break
+    
+    if not res: return None
+
+    return {
+        "max_downstream": res["maxDownstream"],
+        "max_upstream": res["maxUpstream"]
+    }
+
+def get_data_points(address, verfuegbarkeit):
+    return {
+        "points": [{
+            "measurement": MEASUREMENT_NAME,
+            "tags": {
+                "address": address
+            },
+            "fields": {
+                "max_upstream": verfuegbarkeit['max_upstream'],
+                "max_downstream": verfuegbarkeit['max_downstream']
+            },
+            "time": get_current_utc_time()
+        }]
+    }
+
+def get_current_utc_time():
+    return datetime.utcnow().replace(microsecond=0).isoformat()
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+def main():
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--strasse", help="Straße")
+    parser.add_argument("--hausnummer", help="Hausnummer")
+    parser.add_argument("--hausnummerzusatz", help="Hausnummerzusatz", default='')
+    parser.add_argument("--plz", help="PLZ")
+    parser.add_argument("--ort", help="Ort")
+    parser.add_argument("--ortsteil", help="Ortsteil", default='')
+
+    args = parser.parse_args()
+
+    if not args.strasse or not args.hausnummer or not args.plz or not args.ort:
+        eprint("Missing required parameter(s)")
+        exit(1)
+
+    verfuegbarkeit = get_verfuegbarkeit(args.strasse, args.hausnummer,
+        args.plz, args.ort, args.ortsteil, args.hausnummerzusatz)
+
+    if not verfuegbarkeit:
+        exit(1)
+
+    address = "%s %s, %s %s" % ( args.strasse, args.hausnummer, args.plz, args.ort )
+    lines = line_protocol.make_lines(get_data_points(address, verfuegbarkeit))
+    print(lines, end='')
+
+if __name__ == '__main__':
+    main()

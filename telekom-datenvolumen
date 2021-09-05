@@ -1,0 +1,85 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from __future__ import print_function
+import urllib
+import urllib2
+import sys
+import json
+import argparse
+import datetime
+from time import sleep
+from influxdb import line_protocol
+
+MEASUREMENT_NAME = 'telekom_datenvolumen'
+# Avoid DNS and force request through IPv4: This IP address needs to be configured in firewall to be routed via LTE!
+API_URL = 'http://109.237.176.33/api/service/generic/v1/status'
+# Hostname is still required for server to respond.
+API_HOSTNAME = 'pass.telekom.de'
+USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/73.0.3683.86 Safari/537.3'
+MAX_RETRIES = 5
+RETRY_WAIT = 2
+
+def get_info():
+    headers = {
+        'User-Agent': USER_AGENT,
+        'Host': API_HOSTNAME,
+        'Accept': 'application/json'
+    }
+    req = urllib2.Request(API_URL, headers=headers)
+    res = None
+
+    for i in range(MAX_RETRIES+1):
+        try:
+            res = json.loads(urllib2.urlopen(req).read())
+        except Exception as e:
+            eprint("Failed to load JSON data from URL %s, error: %s" % (API_URL, e))
+            if i < MAX_RETRIES:
+                eprint("Will do %i. retry in %i sec(s)..." % (i+1, RETRY_WAIT ))
+                sleep(RETRY_WAIT)
+            else:
+                eprint("Maximum number of retries exceeded, giving up")
+            continue
+        break
+    
+    if not res: return None
+
+    return {
+        "initial_volume": res["initialVolume"],
+        "used_volume": res["usedVolume"],
+        "used_percentage": res["usedPercentage"],
+        "remaining_seconds": res["remainingSeconds"]
+    }
+
+def get_data_points(info):
+    return {
+        "points": [{
+            "measurement": MEASUREMENT_NAME,
+            "fields": {
+                "initial_volume": info["initial_volume"],
+                "used_volume": info["used_volume"],
+                "used_percentage": info["used_percentage"],
+                "remaining_seconds": info["remaining_seconds"]
+            },
+            "time": get_current_utc_time()
+        }]
+    }
+
+def get_current_utc_time():
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat()
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+def main():
+
+    info = get_info()
+
+    if not info:
+        exit(1)
+
+    lines = line_protocol.make_lines(get_data_points(info))
+    print(lines)
+
+if __name__ == '__main__':
+    main()
