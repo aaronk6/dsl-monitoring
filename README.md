@@ -13,6 +13,14 @@ In addition to that, there are two more scripts specifically for Deutsche Teleko
 * `telekom-datenvolumen`: Retrieves the remaining mobile data allowance from http://pass.telekom.de/.
 * `telekom-verfuegbarkeit`: Checks the maximum available DSL bandwidth for a given address in Germany.
 
+## Prerequisites
+
+To use the scripts, make sure to install the dependencies listed in `requirements.txt`.
+
+```
+pip install -r requirements.txt
+```
+
 ## Speedport Smart 4
 
 The script was only tested with modem mode.
