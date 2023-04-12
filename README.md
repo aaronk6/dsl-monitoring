@@ -32,6 +32,17 @@ $ ./smart4-vdsl --hostname 169.254.2.1
 Example output:
 
 ```
-smart4_vdsl_status dsl_downstream=292030i,dsl_link_status="online",dsl_upstream=46720i,firmware_version="010139.1.0.007.0" 1630843177000000000
+{"dsl_link_status": "online", "dsl_downstream": 292030, "dsl_upstream": 46720, "firmware_version": "010139.1.0.007.0"}
 ```
 
+Or, if you want to feed the data into an InfluxDB:
+
+```
+$ ./smart4-vdsl --hostname 169.254.2.1 --format influxdb
+```
+
+Example output:
+
+```
+smart4_vdsl_status dsl_downstream=292030i,dsl_link_status="online",dsl_upstream=46720i,firmware_version="010139.1.0.007.0" 1681309484000000000
+```
