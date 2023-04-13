@@ -12,8 +12,9 @@ from Crypto.Cipher import AES
 
 FORMAT_JSON = 'json'
 FORMAT_INFLUXDB = 'influxdb'
+FORMAT_RAW = 'raw'
 
-OUTPUT_FORMATS = [ FORMAT_JSON, FORMAT_INFLUXDB ]
+OUTPUT_FORMATS = [ FORMAT_JSON, FORMAT_INFLUXDB, FORMAT_RAW ]
 
 DEFAULT_HOSTNAME = '169.254.2.1'
 DEFAULT_PORT = 80
@@ -80,9 +81,11 @@ def get_field(report, name):
         return int(field['varvalue'])
     return field['varvalue']
 
-def get_vdsl_status(hostname, port, key):
+def get_vdsl_status(hostname, port, key, raw=False):
     url = "http://%s:%i%s" % ( hostname, port, STATUS_ROUTE )
     report = http_get_encrypted_json(key, url)
+
+    if raw: return report
 
     status = {}
     for field in REPORT_FIELDS:
@@ -104,7 +107,7 @@ def get_data_points(vdsl_status):
 def get_formatted_output(status, format):
     if (format == FORMAT_INFLUXDB):
         return line_protocol.make_lines(get_data_points(status))
-    elif (format == FORMAT_JSON):
+    elif (format in [ FORMAT_JSON, FORMAT_RAW ]):
         return json.dumps(status)
     else:
         eprint("Unknown format %s" % format)
@@ -129,7 +132,7 @@ def main():
 
     params = parser.parse_args()
 
-    status = get_vdsl_status(params.hostname, params.port, params.key)
+    status = get_vdsl_status(params.hostname, params.port, params.key, params.format == FORMAT_RAW)
     output = get_formatted_output(status, params.format)
 
     if(output == ''): exit(1)
