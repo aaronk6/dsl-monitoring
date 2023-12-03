@@ -28,8 +28,8 @@ RETRY_WAIT = 3
 
 MEASUREMENT_NAME = "smart4_vdsl_status"
 REPORT_FIELDS = [ 'dsl_link_status', 'dsl_downstream', 'dsl_upstream', 'firmware_version' ]
-# Fields are strings by default. Cast these to integers:
-INTEGER_FIELDS = [ 'dsl_downstream', 'dsl_upstream' ]
+# Fields are strings by default. Cast these to integers and optionally divide by 1,000:
+BPS_FIELD = [ 'dsl_downstream', 'dsl_upstream' ]
 
 def http_get_encrypted_json(encryptionKey, url, params={}):
     res = None
@@ -75,13 +75,16 @@ def decrypt_response(keyHex, data):
     decrypted = cipher.decrypt_and_verify(ciphertext, tag)
     return decrypted.decode('utf-8')
 
-def get_field(report, name):
+def get_field(report, name, divide_by_thousand=False):
     field = next((x for x in report if x['varid'] == name), None)
-    if name in INTEGER_FIELDS:
-        return int(field['varvalue'])
+    if name in BPS_FIELD:
+        value = int(field['varvalue'])
+        if divide_by_thousand:
+            return int(value / 1000)
+        return value
     return field['varvalue']
 
-def get_vdsl_status(hostname, port, key, raw=False):
+def get_vdsl_status(hostname, port, key, raw=False, divide_by_thousand=False):
     url = "http://%s:%i%s" % ( hostname, port, STATUS_ROUTE )
     report = http_get_encrypted_json(key, url)
 
@@ -89,7 +92,7 @@ def get_vdsl_status(hostname, port, key, raw=False):
 
     status = {}
     for field in REPORT_FIELDS:
-        status[field] = get_field(report, field)
+        status[field] = get_field(report, field, divide_by_thousand)
 
     return status
 
@@ -129,10 +132,13 @@ def main():
                         help="Specify key for AES decryption (defaults to %s)" % DEFAULT_KEY)
     parser.add_argument("--format", default=DEFAULT_FORMAT,
                         help="Specify the output format (one of %s; defaults to %s)" % ( ', '.join(OUTPUT_FORMATS), DEFAULT_FORMAT ) )
+    parser.add_argument("--divide-by-thousand", action='store_true',
+                        help="Divide sync values by 1,000 (newer firmware versions report in bps instead of kbps), doesn’t apply when format is set to %s" % FORMAT_RAW)
 
     params = parser.parse_args()
 
-    status = get_vdsl_status(params.hostname, params.port, params.key, params.format == FORMAT_RAW)
+    status = get_vdsl_status(params.hostname, params.port, params.key,
+                             params.format == FORMAT_RAW, params.divide_by_thousand)
     output = get_formatted_output(status, params.format)
 
     if(output == ''): exit(1)
