@@ -2,7 +2,7 @@
 
 This is a collection of monitoring scripts for DSL monitoring.
 
-* `smart4-vdsl` (tested with Speedport Smart 4 in **modem mode** and firmware version 010139.1.0.007.0, uses **JSON endpoint**)
+* `smart4-vdsl` (tested with Speedport Smart 4 in **modem mode** and firmware versions 010139.1.0.007.0 and 010139.3.4.001.0, uses **JSON endpoint**)
 * `vigor-vdsl` (tested with DrayTek Vigor165, uses **telnet**)
 * `zyxel-vdsl` (tested with “Digitalisierungsbox BASIC” which is actually a Zyxel VMG8825-D70B, uses **HTML scraping**)
 
