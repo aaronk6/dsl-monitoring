@@ -33,6 +33,7 @@ BPS_FIELD = [ 'dsl_downstream', 'dsl_upstream' ]
 
 def http_get_encrypted_json(encryptionKey, url, params={}):
     res = None
+    error_msg = None
 
     for i in range(MAX_RETRIES+1):
         try:
@@ -45,12 +46,14 @@ def http_get_encrypted_json(encryptionKey, url, params={}):
                 try:
                     decrypted = decrypt_response(encryptionKey, response.text)
                     res = json.loads(decrypted)
-                except ValueError:
-                    eprint("Decryption or JSON parsing failed")
+                except ValueError as e:
+                    error_msg = "Decryption or JSON parsing failed: %s" % e
+                    eprint(error_msg)
                     continue
 
         except Exception as e:
-            eprint("Error: %s" % e)
+            error_msg = "Error: %s" % e
+            eprint(error_msg)
             if i < MAX_RETRIES:
                 eprint("Will do %i. retry in %i sec(s)..." % (i+1, RETRY_WAIT ))
                 sleep(RETRY_WAIT)
@@ -59,7 +62,8 @@ def http_get_encrypted_json(encryptionKey, url, params={}):
             continue
         break
 
-    return res
+    return res, error_msg
+
 
 def decrypt_response(keyHex, data):
     # thanks to https://stackoverflow.com/a/69054338/1387396
@@ -84,9 +88,18 @@ def get_field(report, name, divide_by_thousand=False):
         return value
     return field['varvalue']
 
-def get_vdsl_status(hostname, port, key, raw=False, divide_by_thousand=False):
+def get_vdsl_status(hostname, port, key, raw=False, divide_by_thousand=False, return_error=False):
     url = "http://%s:%i%s" % ( hostname, port, STATUS_ROUTE )
-    report = http_get_encrypted_json(key, url)
+    report, error_msg = http_get_encrypted_json(key, url)
+
+    if not report:
+        eprint("Failed to get status from %s" % url)
+        if return_error:
+            if raw:
+                return ''
+            else:
+                return { "error": 1, "error_msg": error_msg }
+        return None
 
     if raw: return report
 
@@ -133,17 +146,23 @@ def main():
     parser.add_argument("--format", default=DEFAULT_FORMAT,
                         help="Specify the output format (one of %s; defaults to %s)" % ( ', '.join(OUTPUT_FORMATS), DEFAULT_FORMAT ) )
     parser.add_argument("--divide-by-thousand", action='store_true',
-                        help="Divide sync values by 1,000 (newer firmware versions report in bps instead of kbps), doesn’t apply when format is set to %s" % FORMAT_RAW)
+                        help="Divide sync values by 1,000 (newer firmware versions report in bps instead of kbps), doesn't apply when format is set to %s" % FORMAT_RAW)
+    parser.add_argument("--return-error", action='store_true',
+                        help="Return error message in specified output format (not supported for format %s). If not set, the script will exit with code 1 without printning anything to stdout." % FORMAT_RAW)
 
     params = parser.parse_args()
 
+    if (params.return_error and params.format == FORMAT_RAW):
+        eprint("--format %s and --return-error cannot be combined" % FORMAT_RAW)
+        exit(1)
+
     status = get_vdsl_status(params.hostname, params.port, params.key,
-                             params.format == FORMAT_RAW, params.divide_by_thousand)
-    output = get_formatted_output(status, params.format)
+                             params.format == FORMAT_RAW, params.divide_by_thousand,
+                             params.return_error)
+    
+    if not status: exit(1)
 
-    if(output == ''): exit(1)
-
-    print(output)
+    print(get_formatted_output(status, params.format))
 
 if __name__ == '__main__':
     main()
